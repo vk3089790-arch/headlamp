@@ -372,9 +372,19 @@ func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.Respons
 		return
 	}
 
-	if !k8cache.IsKubernetesAPIPath(r.URL.Path) || k8cache.IsSelfSubjectReviewAPIPath(r.URL.Path) {
+	cachePath := k8cache.StripBaseURL(r.URL.Path, c.BaseURL)
+	if !k8cache.IsKubernetesAPIPath(cachePath) || k8cache.IsSelfSubjectReviewAPIPath(cachePath) {
 		next.ServeHTTP(w, r)
 		return
+	}
+
+	cacheReq := r
+	if cachePath != r.URL.Path {
+		u := *r.URL
+		u.Path = cachePath
+		clone := r.Clone(r.Context())
+		clone.URL = &u
+		cacheReq = clone
 	}
 
 	span, contextKey, kContext, err := GetContextKeyAndKContext(w, r, c)
@@ -393,19 +403,22 @@ func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.Respons
 		return
 	}
 
-	if err := k8cache.HandleNonGETCacheInvalidation(k8sResponseCache, w, r, next, connection); err != nil {
+	forwardOriginal := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		next.ServeHTTP(rw, r)
+	})
+	if err := k8cache.HandleNonGETCacheInvalidation(k8sResponseCache, w, cacheReq, forwardOriginal, connection); err != nil {
 		return // The mutation was forwarded exactly once.
 	}
 
 	missingUserToken := kContext.UsesInClusterServiceAccountToken() &&
 		!c.shouldUseUnsafeServiceAccountTokenForContext(kContext) &&
 		requestBearerToken(r) == ""
-	if missingUserToken || !k8cache.CacheableRequest(r) {
+	if missingUserToken || !k8cache.CacheableRequest(cacheReq) {
 		next.ServeHTTP(w, r)
 		return
 	}
 
-	key, err := k8cache.GenerateRequestKey(r, connection)
+	key, err := k8cache.GenerateRequestKey(cacheReq, connection)
 	if err != nil {
 		next.ServeHTTP(w, r)
 		return
@@ -418,7 +431,7 @@ func cacheMiddlewareHandler(c *HeadlampConfig, next http.Handler, w http.Respons
 	}
 
 	if !allowed {
-		if err := k8cache.ReturnAuthErrorResponse(w, r, contextKey); err != nil {
+		if err := k8cache.ReturnAuthErrorResponse(w, cacheReq, contextKey); err != nil {
 			logger.Log(logger.LevelError, nil, err, "failed to return authorization response")
 		}
 
